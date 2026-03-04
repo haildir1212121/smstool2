@@ -1,0 +1,9 @@
+{
+  "name": "smstool-migration",
+  "version": "1.0.0",
+  "description": "Firestore to Azure Cosmos DB migration script",
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "@azure/cosmos": "^4.0.0"
+  }
+}

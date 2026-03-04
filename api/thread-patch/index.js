@@ -7,24 +7,24 @@ module.exports = async function (context, req) {
         const updates = req.body;
         const container = threadsContainer();
 
-        const { resource: existing } = await container.item(threadId, orgId).read();
-        if (!existing) {
+        // Build Cosmos patch operations (single round-trip, no read needed)
+        const ops = [];
+        for (const [key, value] of Object.entries(updates)) {
+            if (key === "_incrementUnread") {
+                ops.push({ op: "incr", path: "/unread", value: value });
+            } else {
+                ops.push({ op: "set", path: `/${key}`, value: value });
+            }
+        }
+
+        const { resource } = await container.item(threadId, orgId).patch(ops);
+
+        context.res = { status: 200, headers: { "Content-Type": "application/json" }, body: resource };
+    } catch (err) {
+        if (err.code === 404) {
             context.res = { status: 404, body: { error: "Thread not found" } };
             return;
         }
-
-        const merged = { ...existing, ...updates };
-
-        // Handle increment operations
-        if (updates._incrementUnread) {
-            merged.unread = (existing.unread || 0) + updates._incrementUnread;
-            delete merged._incrementUnread;
-        }
-
-        await container.item(threadId, orgId).replace(merged);
-
-        context.res = { status: 200, headers: { "Content-Type": "application/json" }, body: merged };
-    } catch (err) {
         context.log.error("thread-patch error:", err.message);
         context.res = { status: 500, body: { error: err.message } };
     }

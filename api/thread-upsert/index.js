@@ -7,6 +7,7 @@ module.exports = async function (context, req) {
         const data = req.body;
         const container = threadsContainer();
 
+        // Always read existing doc to preserve fields
         let existing = null;
         try {
             const { resource } = await container.item(threadId, orgId).read();

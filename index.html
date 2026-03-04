@@ -225,7 +225,7 @@
   async function apiUpload(threadId, file) { const res = await fetch(`${API_BASE}/upload?threadId=${encodeURIComponent(threadId)}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }); if (!res.ok) throw new Error(`Upload ${res.status}`); return res.json(); }
 
   // ADDED PAGINATION STATE
-  let store = { threads: [], logs: [], activeThreadId: null, activeThread: null, pinned: new Set(), drafts: {}, cannedReplies: [], deletedSids: new Set(), lastInboundSidSeen: new Set(), isPolling: false, pendingMedia: [], isFirstLoad: true, onlyUnread: false, onlyUrgent: false, tagFilter: new Set(), notifQueue: {}, notifTimer: null, cmPage: 1, logPage: 1, itemsPerPage: 15, msgPollTimer: null };
+  let store = { threads: [], logs: [], activeThreadId: null, activeThread: null, pinned: new Set(), drafts: {}, cannedReplies: [], deletedSids: new Set(), lastInboundSidSeen: new Set(), isPolling: false, pendingMedia: [], isFirstLoad: true, onlyUnread: false, onlyUrgent: false, tagFilter: new Set(), notifQueue: {}, notifTimer: null, cmPage: 1, logPage: 1, itemsPerPage: 15, msgPollTimer: null, lastThreadPollMs: 0, cachedMessages: [], lastMsgCreatedAt: null };
   
   // Make store global so pagination buttons can access it
   window.store = store;
@@ -455,14 +455,26 @@ const ymd = (ms) => {
   async function pollMessages() {
       if (!store.activeThreadId) return;
       try {
-          const messages = await apiGet(messagesPath(store.activeThreadId));
-          renderMessages(messages);
+          if (store.lastMsgCreatedAt) {
+              const newer = await apiGet(messagesPath(store.activeThreadId) + `?since=${encodeURIComponent(store.lastMsgCreatedAt)}`);
+              if (newer.length) {
+                  store.cachedMessages = (store.cachedMessages || []).concat(newer);
+                  store.lastMsgCreatedAt = newer[newer.length - 1].createdAt;
+                  renderMessages(store.cachedMessages);
+              }
+          } else {
+              const messages = await apiGet(messagesPath(store.activeThreadId));
+              store.cachedMessages = messages;
+              if (messages.length) store.lastMsgCreatedAt = messages[messages.length - 1].createdAt;
+              renderMessages(messages);
+          }
       } catch(e) { console.error("pollMessages error:", e); }
   }
 
   window.loadThread = async (id) => {
       if(store.msgPollTimer) clearInterval(store.msgPollTimer);
       store.activeThreadId = id; store.activeThread = store.threads.find(t=>t.id===id);
+      store.cachedMessages = []; store.lastMsgCreatedAt = null;
       if(store.activeThread) { store.activeThread.unread = 0; window.renderThreadList(); }
       document.getElementById("welcomeState").classList.add("hidden");
       document.getElementById("activeContactName").innerText = store.activeThread?.name || id; document.getElementById("activeContactPhone").innerText = store.activeThread?.phone || id;
@@ -474,7 +486,7 @@ const ymd = (ms) => {
       try { await apiPatch(threadPath(id), { unread: 0, lastReadAtMs: Date.now() }); } catch {}
 
       await pollMessages();
-      store.msgPollTimer = setInterval(pollMessages, 3000);
+      store.msgPollTimer = setInterval(pollMessages, 6000);
   };
 
   const shiftKeywords = ["call it a day", "head home", "last trip", "good to go home", "done for the day", "you are clear"];
@@ -677,8 +689,19 @@ const ymd = (ms) => {
   
   async function pollThreads() {
       try {
-          const threads = await apiGet("/threads");
-          store.threads = threads.map(d => { if (!d.id) d.id = d.phone; return d; });
+          let threads;
+          if (store.lastThreadPollMs) {
+              const updated = await apiGet(`/threads?since=${store.lastThreadPollMs}`);
+              if (updated.length) {
+                  const map = new Map(store.threads.map(t => [t.id, t]));
+                  updated.forEach(t => { if (!t.id) t.id = t.phone; map.set(t.id, t); });
+                  store.threads = Array.from(map.values()).sort((a,b) => (b.lastMessageAtMs||0) - (a.lastMessageAtMs||0));
+              }
+          } else {
+              threads = await apiGet("/threads");
+              store.threads = threads.map(d => { if (!d.id) d.id = d.phone; return d; });
+          }
+          store.lastThreadPollMs = Date.now();
           if(store.activeThreadId) store.activeThread = store.threads.find(t=>t.id===store.activeThreadId);
           window.renderThreadList();
           if(store.activeThreadId && store.activeThread) document.getElementById("activeContactName").innerText = store.activeThread.name;
@@ -689,8 +712,8 @@ const ymd = (ms) => {
       // Initial data load from Azure Cosmos DB
       await pollThreads();
       // Poll threads and Twilio messages on intervals
-      setInterval(pollThreads, 5000);
-      setInterval(poll, 8000);
+      setInterval(pollThreads, 12000);
+      setInterval(poll, 10000);
 
       store.cannedReplies = JSON.parse(localStorage.getItem("canned")||"[]"); window.renderQuickReplies();
       document.addEventListener("visibilitychange", async () => {

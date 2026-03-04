@@ -1,6 +1,12 @@
 const { getContainerClient } = require("../shared/storage");
 const crypto = require("crypto");
 
+const MIME_TO_EXT = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "video/mp4": ".mp4", "video/quicktime": ".mov",
+    "application/octet-stream": ""
+};
+
 module.exports = async function (context, req) {
     try {
         const orgId = req.query.orgId || "dispatch_team_main";
@@ -12,20 +18,21 @@ module.exports = async function (context, req) {
         }
 
         const body = req.body;
-        if (!body || !body.length) {
+        if (!body || !Buffer.isBuffer(body) && !body.length) {
             context.res = { status: 400, body: { error: "Request body must contain file data" } };
             return;
         }
 
+        const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
         const containerClient = getContainerClient();
         await containerClient.createIfNotExists({ access: "blob" });
 
-        const blobName = `mms/${orgId}/${threadId}/${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+        const contentType = req.headers["content-type"] || "application/octet-stream";
+        const ext = MIME_TO_EXT[contentType] || "";
+        const blobName = `mms/${orgId}/${threadId}/${Date.now()}_${crypto.randomUUID().slice(0, 8)}${ext}`;
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
-        const contentType = req.headers["content-type"] || "application/octet-stream";
-
-        await blockBlobClient.upload(body, body.length, {
+        await blockBlobClient.upload(buf, buf.length, {
             blobHTTPHeaders: { blobContentType: contentType }
         });
 

@@ -210,22 +210,25 @@
   </div>
 
 <script type="module">
+  import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+  // ---- CONFIG (replace with your Supabase project values) ----
+  const SUPABASE_URL = "YOUR_SUPABASE_URL";
+  const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
+  const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
   const SMS_BACKEND_BASE = "https://sms-backend-3488.twil.io";
   const SHARED_ORG_ID = "dispatch_team_main";
   const TWILIO_SEND_URL = `${SMS_BACKEND_BASE}/send-sms`;
   const TWILIO_GET_URL  = `${SMS_BACKEND_BASE}/get-messages`;
-  const API_BASE = "/api";
 
-  // Azure API helper functions (replaces Firebase SDK)
-  async function apiGet(path) { const res = await fetch(`${API_BASE}${path}`); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
-  async function apiPut(path, body) { const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
-  async function apiPatch(path, body) { const res = await fetch(`${API_BASE}${path}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
-  async function apiPost(path, body) { const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
-  async function apiDelete(path) { const res = await fetch(`${API_BASE}${path}`, { method: "DELETE" }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
-  async function apiUpload(threadId, file) { const res = await fetch(`${API_BASE}/upload?threadId=${encodeURIComponent(threadId)}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }); if (!res.ok) throw new Error(`Upload ${res.status}`); return res.json(); }
+  // ---- DB <-> JS case conversion (snake_case <-> camelCase) ----
+  const toSnake = (s) => s.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`);
+  const toCamel = (s) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  const dbRow = (obj) => { if (!obj) return null; const r = {}; for (const [k,v] of Object.entries(obj)) r[toCamel(k)] = v; return r; };
+  const dbVal = (obj) => { if (!obj) return null; const r = {}; for (const [k,v] of Object.entries(obj)) { if (!k.startsWith('_')) r[toSnake(k)] = v; } return r; };
 
-  // ADDED PAGINATION STATE
-  let store = { threads: [], logs: [], activeThreadId: null, activeThread: null, pinned: new Set(), drafts: {}, cannedReplies: [], deletedSids: new Set(), lastInboundSidSeen: new Set(), isPolling: false, pendingMedia: [], isFirstLoad: true, onlyUnread: false, onlyUrgent: false, tagFilter: new Set(), notifQueue: {}, notifTimer: null, cmPage: 1, logPage: 1, itemsPerPage: 15, msgPollTimer: null, lastThreadPollMs: 0, cachedMessages: [], lastMsgCreatedAt: null };
+  let store = { threads: [], logs: [], activeThreadId: null, activeThread: null, pinned: new Set(), drafts: {}, cannedReplies: [], deletedSids: new Set(), lastInboundSidSeen: new Set(), isPolling: false, pendingMedia: [], isFirstLoad: true, onlyUnread: false, onlyUrgent: false, tagFilter: new Set(), notifQueue: {}, notifTimer: null, cmPage: 1, logPage: 1, itemsPerPage: 15, cachedMessages: [] };
   
   // Make store global so pagination buttons can access it
   window.store = store;
@@ -278,7 +281,12 @@ const ymd = (ms) => {
                 const phone = normalizePhone(m.from);
                 const msgTime = new Date(m.dateCreated).getTime();
 
-                await apiPut(messagePath(phone, m.sid), { body:m.body, direction:"received", createdAt: new Date(msgTime).toISOString(), sid:m.sid, mediaUrls: m.mediaUrls||[] });
+                await sb.from('messages').upsert({
+                    id: m.sid, thread_id: phone, body: m.body,
+                    direction: 'received', sid: m.sid,
+                    media_urls: m.mediaUrls || [],
+                    created_at: new Date(msgTime).toISOString()
+                }, { onConflict: 'thread_id,id' });
 
                 const t = store.threads.find(x => x.id === phone);
                 const isViewing = (store.activeThreadId === phone && document.visibilityState === 'visible');
@@ -288,28 +296,32 @@ const ymd = (ms) => {
                 const isMaintenance = vehicleKeywords.some(k => lowerBody.includes(k));
 
                 if (isMaintenance) {
-                    apiPost("/logs", {
-                        type: "vehicle_alert",
-                        threadName: t ? (t.name || phone) : phone,
-                        phone: phone,
-                        message: m.body,
-                        threadId: phone
-                    }).catch(() => {});
+                    sb.from('logs').insert({
+                        org_id: SHARED_ORG_ID, type: 'vehicle_alert',
+                        thread_name: t ? (t.name || phone) : phone,
+                        phone, message: m.body, thread_id: phone
+                    }).then(() => {});
                     window.showToast("Vehicle Issue Detected!", "error");
                 }
 
-                const updateData = { lastMessageText: m.body || "[Attachment]", lastMessageAtMs: msgTime, id: phone, phone: phone };
-                if (!isViewing) updateData._incrementUnread = 1; else updateData.unread = 0;
-                if (isMaintenance) updateData.isUrgent = true;
-                if (!t) updateData.name = phone;
-
                 const currentLastMs = t ? (t.lastMessageAtMs || 0) : 0;
                 if (msgTime > currentLastMs) {
-                    await apiPut(threadPath(phone), updateData);
+                    const updates = { last_message_text: m.body || '[Attachment]', last_message_at_ms: msgTime };
+                    if (isMaintenance) updates.is_urgent = true;
+
+                    if (!t) {
+                        await sb.from('threads').insert({
+                            id: phone, org_id: SHARED_ORG_ID, phone, name: phone,
+                            ...updates, unread: isViewing ? 0 : 1
+                        });
+                    } else {
+                        if (!isViewing) await sb.rpc('increment_unread', { p_thread_id: phone, p_org_id: SHARED_ORG_ID });
+                        await sb.from('threads').update(updates).eq('id', phone).eq('org_id', SHARED_ORG_ID);
+                    }
                 }
             }
           }
-      } catch(e){} finally { store.isPolling=false; }
+      } catch(e){ console.error("poll error:", e); } finally { store.isPolling=false; }
   }
 
   window.switchView = (v) => {
@@ -323,14 +335,11 @@ const ymd = (ms) => {
   };
   window.toggleInfoPanel = () => document.getElementById("infoPanel").classList.toggle("hidden");
 
-  // Azure API path helpers (replacing Firebase collection/doc references)
-  const threadPath = (id) => `/threads/${encodeURIComponent(id)}`;
-  const messagesPath = (id) => `/threads/${encodeURIComponent(id)}/messages`;
-  const messagePath = (id, msgId) => `/threads/${encodeURIComponent(id)}/messages/${encodeURIComponent(msgId)}`;
-
   window.deleteActiveThread = async () => {
       if(!store.activeThreadId || !confirm("Permanently delete this conversation?")) return;
-      await apiDelete(threadPath(store.activeThreadId));
+      const id = store.activeThreadId;
+      await sb.from('messages').delete().eq('thread_id', id);
+      await sb.from('threads').delete().eq('id', id).eq('org_id', SHARED_ORG_ID);
       store.activeThreadId = null;
       document.getElementById("messageList").innerHTML = "";
       document.getElementById("welcomeState").classList.remove("hidden");
@@ -340,7 +349,8 @@ const ymd = (ms) => {
 
   window.deleteContact = async (id) => {
       if(!confirm("Delete this contact and all their messages?")) return;
-      await apiDelete(threadPath(id));
+      await sb.from('messages').delete().eq('thread_id', id);
+      await sb.from('threads').delete().eq('id', id).eq('org_id', SHARED_ORG_ID);
       window.renderContactsManagerTable();
       window.showToast("Contact Deleted");
   };
@@ -453,29 +463,25 @@ const ymd = (ms) => {
       document.getElementById("detailsAttachments").innerHTML = atts.slice(0,9).map(u => `<a href="${u}" target="_blank" class="block h-20 rounded-lg bg-slate-50 border bg-cover bg-center" style="background-image:url('${u}')"></a>`).join("");
   }
 
-  async function pollMessages() {
-      if (!store.activeThreadId) return;
-      try {
-          if (store.lastMsgCreatedAt) {
-              const newer = await apiGet(messagesPath(store.activeThreadId) + `?since=${encodeURIComponent(store.lastMsgCreatedAt)}`);
-              if (newer.length) {
-                  store.cachedMessages = (store.cachedMessages || []).concat(newer);
-                  store.lastMsgCreatedAt = newer[newer.length - 1].createdAt;
+  // Real-time message subscription (replaces polling)
+  let msgChannel = null;
+  function subscribeToMessages(threadId) {
+      if (msgChannel) { sb.removeChannel(msgChannel); msgChannel = null; }
+      if (!threadId) return;
+      msgChannel = sb.channel(`msg-${threadId.replace(/[^a-zA-Z0-9]/g, '_')}-${Date.now()}`)
+          .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `thread_id=eq.${threadId}` }, (payload) => {
+              const msg = dbRow(payload.new);
+              if (msg && !store.cachedMessages.find(m => m.id === msg.id)) {
+                  store.cachedMessages.push(msg);
                   renderMessages(store.cachedMessages);
               }
-          } else {
-              const messages = await apiGet(messagesPath(store.activeThreadId));
-              store.cachedMessages = messages;
-              if (messages.length) store.lastMsgCreatedAt = messages[messages.length - 1].createdAt;
-              renderMessages(messages);
-          }
-      } catch(e) { console.error("pollMessages error:", e); }
+          })
+          .subscribe();
   }
 
   window.loadThread = async (id) => {
-      if(store.msgPollTimer) clearInterval(store.msgPollTimer);
       store.activeThreadId = id; store.activeThread = store.threads.find(t=>t.id===id);
-      store.cachedMessages = []; store.lastMsgCreatedAt = null;
+      store.cachedMessages = [];
       if(store.activeThread) { store.activeThread.unread = 0; window.renderThreadList(); }
       document.getElementById("welcomeState").classList.add("hidden");
       document.getElementById("activeContactName").innerText = store.activeThread?.name || id; document.getElementById("activeContactPhone").innerText = store.activeThread?.phone || id;
@@ -484,10 +490,15 @@ const ymd = (ms) => {
       document.getElementById("detailsTagsInput").value = (store.activeThread?.tags||[]).join(", "); document.getElementById("detailsNotes").value = store.activeThread?.notes||"";
       document.getElementById("msgInput").value = store.drafts[id] || "";
       document.getElementById("headerUrgentBtn").className = store.activeThread.isUrgent ? "w-8 h-8 flex items-center justify-center rounded bg-rose-100 text-rose-500" : "w-8 h-8 flex items-center justify-center rounded hover:bg-rose-50 hover:text-rose-500 text-slate-400";
-      apiPatch(threadPath(id), { unread: 0, lastReadAtMs: Date.now() }).catch(() => {});
+      sb.from('threads').update({ unread: 0, last_read_at_ms: Date.now() }).eq('id', id).eq('org_id', SHARED_ORG_ID).then(() => {});
 
-      await pollMessages();
-      store.msgPollTimer = setInterval(pollMessages, 6000);
+      // Fetch all messages for this thread
+      const { data } = await sb.from('messages').select('*').eq('thread_id', id).order('created_at', { ascending: true });
+      store.cachedMessages = (data || []).map(dbRow);
+      renderMessages(store.cachedMessages);
+
+      // Subscribe to new messages (real-time push, no polling)
+      subscribeToMessages(id);
   };
 
   const shiftKeywords = ["call it a day", "head home", "last trip", "good to go home", "done for the day", "you are clear"];
@@ -499,25 +510,28 @@ const ymd = (ms) => {
     try {
         const lowerTxt = txt.toLowerCase();
         if (shiftKeywords.some(k => lowerTxt.includes(k))) {
-            await apiPost("/logs", { type:"end_shift", threadName: store.activeThread.name||"Unknown", phone: store.activeThread.phone, message:txt, threadId: store.activeThreadId });
+            await sb.from('logs').insert({ org_id: SHARED_ORG_ID, type: 'end_shift', thread_name: store.activeThread.name||"Unknown", phone: store.activeThread.phone, message: txt, thread_id: store.activeThreadId });
             window.showToast("Logged: End of Shift");
         }
         let mediaUrls = [];
         if (store.pendingMedia.length) {
           mediaUrls = await Promise.all(
             store.pendingMedia.map(async (file) => {
-              const result = await apiUpload(store.activeThreadId, file);
-              return result.url;
+              const path = `mms/${SHARED_ORG_ID}/${store.activeThreadId}/${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+              const { error } = await sb.storage.from('media').upload(path, file, { contentType: file.type || 'application/octet-stream' });
+              if (error) throw error;
+              const { data: { publicUrl } } = sb.storage.from('media').getPublicUrl(path);
+              return publicUrl;
             })
           );
         }
         const res = await fetch(TWILIO_SEND_URL, { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: store.activeThread.phone, body: txt, mediaUrls }) });
         if(!res.ok) throw new Error("API Fail");
         const sid = `loc-${Date.now()}`;
-        await apiPut(messagePath(store.activeThreadId, sid), { body: txt, direction: "sent", sid, mediaUrls });
-        await apiPatch(threadPath(store.activeThreadId), { lastMessageText: txt || "[Attachment]", lastMessageAtMs: Date.now() });
-        document.getElementById("msgInput").value = ""; 
-        document.getElementById("msgInput").style.height = 'auto'; // RESET HEIGHT
+        await sb.from('messages').upsert({ id: sid, thread_id: store.activeThreadId, body: txt, direction: 'sent', sid, media_urls: mediaUrls, created_at: new Date().toISOString() }, { onConflict: 'thread_id,id' });
+        await sb.from('threads').update({ last_message_text: txt || "[Attachment]", last_message_at_ms: Date.now() }).eq('id', store.activeThreadId).eq('org_id', SHARED_ORG_ID);
+        document.getElementById("msgInput").value = "";
+        document.getElementById("msgInput").style.height = 'auto';
         store.pendingMedia=[]; window.updateMmsStrip();
     } catch(e) { console.error(e); window.showToast("Send failed", "error"); } finally { btn.disabled = false; }
   };
@@ -529,12 +543,12 @@ const ymd = (ms) => {
       broadcastActive = true; document.getElementById("massComposeArea").classList.add("hidden"); document.getElementById("massProgressArea").classList.remove("hidden"); document.getElementById("massProgressArea").classList.add("flex");
       const log = document.getElementById("massLogBox"); const pBar = document.getElementById("massProgressBar");
       document.getElementById("massTotalCount").innerText = contacts.length; let sent = 0;
-      await apiPost("/logs", { type:"broadcast_start", count: contacts.length, message:txt });
+      await sb.from('logs').insert({ org_id: SHARED_ORG_ID, type: 'broadcast_start', count: contacts.length, message: txt });
       for(let i=0; i<contacts.length; i++) {
           if(!broadcastActive) break; const t = contacts[i]; log.innerHTML += `<div>Sending to ${t.name}...</div>`;
           try {
              const res = await fetch(TWILIO_SEND_URL, { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: t.phone, body: txt, mediaUrls: [] }) });
-             if(res.ok) { const sid = `mass-${Date.now()}-${Math.random()}`; await apiPut(messagePath(t.id, sid), { body: txt, direction: "sent", sid, mediaUrls: [] }); await apiPatch(threadPath(t.id), { lastMessageText: txt, lastMessageAtMs: Date.now() }); sent++; document.getElementById("massSentCount").innerText = sent; pBar.style.width = `${(sent/contacts.length)*100}%`; } else { log.innerHTML += `<div class="text-rose-400">Failed: ${t.phone}</div>`; }
+             if(res.ok) { const sid = `mass-${Date.now()}-${Math.random()}`; await sb.from('messages').upsert({ id: sid, thread_id: t.id, body: txt, direction: 'sent', sid, media_urls: [], created_at: new Date().toISOString() }, { onConflict: 'thread_id,id' }); await sb.from('threads').update({ last_message_text: txt, last_message_at_ms: Date.now() }).eq('id', t.id).eq('org_id', SHARED_ORG_ID); sent++; document.getElementById("massSentCount").innerText = sent; pBar.style.width = `${(sent/contacts.length)*100}%`; } else { log.innerHTML += `<div class="text-rose-400">Failed: ${t.phone}</div>`; }
           } catch(e) { log.innerHTML += `<div class="text-rose-400">Error: ${e.message}</div>`; }
           log.scrollTop = log.scrollHeight; await new Promise(r => setTimeout(r, 400)); 
       }
@@ -593,7 +607,7 @@ const ymd = (ms) => {
     const tags = document.querySelectorAll(".cm-tags");
     const updates = [];
     for(let i=0; i<names.length; i++) {
-        updates.push(apiPatch(threadPath(names[i].dataset.id), { name: names[i].value.trim(), tags: tags[i].value.split(",").filter(Boolean) }));
+        updates.push(sb.from('threads').update({ name: names[i].value.trim(), tags: tags[i].value.split(",").filter(Boolean) }).eq('id', names[i].dataset.id).eq('org_id', SHARED_ORG_ID));
     }
     await Promise.all(updates);
     window.showToast("Directory Saved");
@@ -615,7 +629,8 @@ const ymd = (ms) => {
 
       // LOAD ALL LOGS ONCE IF EMPTY (Client-side cache)
       if (store.logs.length === 0) {
-          store.logs = await apiGet("/logs?limit=200");
+          const { data } = await sb.from('logs').select('*').eq('org_id', SHARED_ORG_ID).order('created_at', { ascending: false }).limit(200);
+          store.logs = (data || []).map(dbRow);
       }
 
       const tbody = document.getElementById("logbookList"); 
@@ -670,58 +685,65 @@ const ymd = (ms) => {
     const cleanPhone = normalizePhone(rawPhone);
     const name = document.getElementById("newContactName").value;
     if(cleanPhone.length < 10) { window.showToast("Invalid Phone Number", "error"); return; }
-    await apiPut(threadPath(cleanPhone), { id: cleanPhone, phone: cleanPhone, name: name, unread:0, lastMessageAtMs: Date.now() });
+    await sb.from('threads').upsert({ id: cleanPhone, org_id: SHARED_ORG_ID, phone: cleanPhone, name: name, unread: 0, last_message_at_ms: Date.now() });
     document.getElementById("newMsgModal").classList.add("hidden");
     window.loadThread(cleanPhone);
 };
-  window.toggleUrgentThread = async () => { if(store.activeThreadId) await apiPatch(threadPath(store.activeThreadId), { isUrgent: !store.activeThread.isUrgent }); };
+  window.toggleUrgentThread = async () => { if(store.activeThreadId) await sb.from('threads').update({ is_urgent: !store.activeThread.isUrgent }).eq('id', store.activeThreadId).eq('org_id', SHARED_ORG_ID); };
   window.toggleUnreadOnly = () => { store.onlyUnread = !store.onlyUnread; window.renderThreadList(); };
   window.toggleUrgentOnly = () => { store.onlyUrgent = !store.onlyUrgent; window.renderThreadList(); };
   window.openSettingsModal = () => { document.getElementById("settingsModal").classList.remove("hidden"); document.getElementById("cannedRepliesInput").value = store.cannedReplies.join("\n"); };
   window.saveSettings = () => { store.cannedReplies = document.getElementById("cannedRepliesInput").value.split("\n").filter(Boolean); localStorage.setItem("canned", JSON.stringify(store.cannedReplies)); document.getElementById("settingsModal").classList.add("hidden"); window.renderQuickReplies(); };
   window.renderQuickReplies = () => { const r = document.getElementById("quickRepliesRow"); r.innerHTML=""; (JSON.parse(localStorage.getItem("canned")||"[]")).forEach(t => { const b=document.createElement("button"); b.className="shrink-0 px-3 py-1 bg-white border border-gray-200 rounded-full text-xs text-gray-600 whitespace-nowrap hover:border-blue-400 transition shadow-sm"; b.innerText=t; b.onclick=()=>{document.getElementById("msgInput").value+=t;}; r.appendChild(b); }); };
   window.insertTemplate = () => { const v = document.getElementById("templateSelect").value; if(v) document.getElementById("msgInput").value += v; document.getElementById("templateSelect").value = ""; };
-  window.saveDetailsTags = () => apiPatch(threadPath(store.activeThreadId), { tags: document.getElementById("detailsTagsInput").value.split(",").map(t=>t.trim()).filter(Boolean) });
-  window.saveDetailsNotes = () => apiPatch(threadPath(store.activeThreadId), { notes: document.getElementById("detailsNotes").value });
+  window.saveDetailsTags = () => sb.from('threads').update({ tags: document.getElementById("detailsTagsInput").value.split(",").map(t=>t.trim()).filter(Boolean) }).eq('id', store.activeThreadId).eq('org_id', SHARED_ORG_ID);
+  window.saveDetailsNotes = () => sb.from('threads').update({ notes: document.getElementById("detailsNotes").value }).eq('id', store.activeThreadId).eq('org_id', SHARED_ORG_ID);
   window.handleMmsFiles = (inp) => { store.pendingMedia = Array.from(inp.files); window.updateMmsStrip(); };
   window.updateMmsStrip = () => { const d = document.getElementById("mmsStrip"); d.classList.toggle("hidden", !store.pendingMedia.length); d.innerHTML = store.pendingMedia.map(f => `<div class="h-10 w-10 bg-slate-200 rounded overflow-hidden flex items-center justify-center text-xs border border-slate-300"><i class="fa-solid fa-file"></i></div>`).join(""); };
   window.callActivePhone = () => window.open(`tel:${store.activeThread?.phone}`);
   window.copyActivePhone = () => { navigator.clipboard.writeText(store.activeThread?.phone); window.showToast("Copied"); };
   
-  async function pollThreads() {
-      try {
-          if (store.lastThreadPollMs) {
-              const sinceSec = Math.floor(store.lastThreadPollMs / 1000);
-              const updated = await apiGet(`/threads?since=${sinceSec}`);
-              if (updated.length) {
-                  const map = new Map(store.threads.map(t => [t.id, t]));
-                  updated.forEach(t => { if (!t.id) t.id = t.phone; map.set(t.id, t); });
-                  store.threads = Array.from(map.values()).sort((a,b) => (b.lastMessageAtMs||0) - (a.lastMessageAtMs||0));
-              }
+  async function loadThreads() {
+      const { data } = await sb.from('threads').select('*').eq('org_id', SHARED_ORG_ID).order('last_message_at_ms', { ascending: false });
+      store.threads = (data || []).map(dbRow);
+      if(store.activeThreadId) store.activeThread = store.threads.find(t=>t.id===store.activeThreadId);
+      window.renderThreadList();
+      if(store.activeThreadId && store.activeThread) document.getElementById("activeContactName").innerText = store.activeThread.name;
+  }
+
+  // Real-time subscription for threads (replaces pollThreads entirely)
+  sb.channel('threads-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'threads' }, (payload) => {
+          if (payload.eventType === 'DELETE') {
+              store.threads = store.threads.filter(t => t.id !== payload.old.id);
           } else {
-              const threads = await apiGet("/threads");
-              store.threads = threads.map(d => { if (!d.id) d.id = d.phone; return d; });
+              const thread = dbRow(payload.new);
+              if (!thread || thread.orgId !== SHARED_ORG_ID) return;
+              const idx = store.threads.findIndex(t => t.id === thread.id);
+              if (idx >= 0) store.threads[idx] = thread;
+              else store.threads.push(thread);
+              store.threads.sort((a,b) => (b.lastMessageAtMs||0) - (a.lastMessageAtMs||0));
           }
-          store.lastThreadPollMs = Date.now();
           if(store.activeThreadId) store.activeThread = store.threads.find(t=>t.id===store.activeThreadId);
           window.renderThreadList();
           if(store.activeThreadId && store.activeThread) document.getElementById("activeContactName").innerText = store.activeThread.name;
-      } catch(e) { console.error("pollThreads error:", e); }
-  }
+      })
+      .subscribe();
 
   (async function init() {
-      // Load threads and check Twilio in parallel for faster startup
-      await Promise.all([pollThreads(), poll()]);
-      // Poll threads and Twilio messages on intervals
-      setInterval(pollThreads, 12000);
+      // Load threads and check Twilio in parallel for fast startup
+      await Promise.all([loadThreads(), poll()]);
+      // Twilio inbound poll still needed (external API)
       setInterval(poll, 10000);
+      // Safety net: full reload every 60s in case realtime misses anything
+      setInterval(loadThreads, 60000);
 
       store.cannedReplies = JSON.parse(localStorage.getItem("canned")||"[]"); window.renderQuickReplies();
       document.addEventListener("visibilitychange", async () => {
           if (document.visibilityState === "visible" && store.activeThreadId) {
               const t = store.threads.find(x => x.id === store.activeThreadId);
               if(t) { t.unread = 0; window.renderThreadList(); }
-              apiPatch(threadPath(store.activeThreadId), { unread: 0, lastReadAtMs: Date.now() }).catch(() => {});
+              sb.from('threads').update({ unread: 0, last_read_at_ms: Date.now() }).eq('id', store.activeThreadId).eq('org_id', SHARED_ORG_ID).then(() => {});
           }
       });
 

@@ -1,0 +1,9 @@
+{
+  "name": "smstool-api",
+  "version": "1.0.0",
+  "description": "Azure Functions API for SMS Tool - Cosmos DB + Blob Storage backend",
+  "dependencies": {
+    "@azure/cosmos": "^4.0.0",
+    "@azure/storage-blob": "^12.17.0"
+  }
+}

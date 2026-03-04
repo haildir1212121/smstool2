@@ -272,7 +272,8 @@ const ymd = (ms) => {
       try {
           const res = await fetch(`${TWILIO_GET_URL}?after=${Date.now()-15000}`); const data = await res.json();
           if(data.success) {
-            data.messages.filter(m=>m.direction==="inbound" && !store.lastInboundSidSeen.has(m.sid)).forEach(async m => {
+            const newMsgs = data.messages.filter(m=>m.direction==="inbound" && !store.lastInboundSidSeen.has(m.sid));
+            for (const m of newMsgs) {
                 store.lastInboundSidSeen.add(m.sid);
                 const phone = normalizePhone(m.from);
                 const msgTime = new Date(m.dateCreated).getTime();
@@ -283,21 +284,21 @@ const ymd = (ms) => {
                 const isViewing = (store.activeThreadId === phone && document.visibilityState === 'visible');
                 if (!isViewing) queueNotification(phone, t ? (t.name || phone) : phone, m.body);
 
-                const lowerBody = m.body.toLowerCase();
+                const lowerBody = (m.body || "").toLowerCase();
                 const isMaintenance = vehicleKeywords.some(k => lowerBody.includes(k));
 
                 if (isMaintenance) {
-                    await apiPost("/logs", {
+                    apiPost("/logs", {
                         type: "vehicle_alert",
                         threadName: t ? (t.name || phone) : phone,
                         phone: phone,
                         message: m.body,
                         threadId: phone
-                    });
+                    }).catch(() => {});
                     window.showToast("Vehicle Issue Detected!", "error");
                 }
 
-                const updateData = { lastMessageText: m.body, lastMessageAtMs: msgTime, id: phone, phone: phone };
+                const updateData = { lastMessageText: m.body || "[Attachment]", lastMessageAtMs: msgTime, id: phone, phone: phone };
                 if (!isViewing) updateData._incrementUnread = 1; else updateData.unread = 0;
                 if (isMaintenance) updateData.isUrgent = true;
                 if (!t) updateData.name = phone;
@@ -306,7 +307,7 @@ const ymd = (ms) => {
                 if (msgTime > currentLastMs) {
                     await apiPut(threadPath(phone), updateData);
                 }
-            });
+            }
           }
       } catch(e){} finally { store.isPolling=false; }
   }
@@ -483,7 +484,7 @@ const ymd = (ms) => {
       document.getElementById("detailsTagsInput").value = (store.activeThread?.tags||[]).join(", "); document.getElementById("detailsNotes").value = store.activeThread?.notes||"";
       document.getElementById("msgInput").value = store.drafts[id] || "";
       document.getElementById("headerUrgentBtn").className = store.activeThread.isUrgent ? "w-8 h-8 flex items-center justify-center rounded bg-rose-100 text-rose-500" : "w-8 h-8 flex items-center justify-center rounded hover:bg-rose-50 hover:text-rose-500 text-slate-400";
-      try { await apiPatch(threadPath(id), { unread: 0, lastReadAtMs: Date.now() }); } catch {}
+      apiPatch(threadPath(id), { unread: 0, lastReadAtMs: Date.now() }).catch(() => {});
 
       await pollMessages();
       store.msgPollTimer = setInterval(pollMessages, 6000);
@@ -689,16 +690,16 @@ const ymd = (ms) => {
   
   async function pollThreads() {
       try {
-          let threads;
           if (store.lastThreadPollMs) {
-              const updated = await apiGet(`/threads?since=${store.lastThreadPollMs}`);
+              const sinceSec = Math.floor(store.lastThreadPollMs / 1000);
+              const updated = await apiGet(`/threads?since=${sinceSec}`);
               if (updated.length) {
                   const map = new Map(store.threads.map(t => [t.id, t]));
                   updated.forEach(t => { if (!t.id) t.id = t.phone; map.set(t.id, t); });
                   store.threads = Array.from(map.values()).sort((a,b) => (b.lastMessageAtMs||0) - (a.lastMessageAtMs||0));
               }
           } else {
-              threads = await apiGet("/threads");
+              const threads = await apiGet("/threads");
               store.threads = threads.map(d => { if (!d.id) d.id = d.phone; return d; });
           }
           store.lastThreadPollMs = Date.now();
@@ -709,8 +710,8 @@ const ymd = (ms) => {
   }
 
   (async function init() {
-      // Initial data load from Azure Cosmos DB
-      await pollThreads();
+      // Load threads and check Twilio in parallel for faster startup
+      await Promise.all([pollThreads(), poll()]);
       // Poll threads and Twilio messages on intervals
       setInterval(pollThreads, 12000);
       setInterval(poll, 10000);
@@ -720,7 +721,7 @@ const ymd = (ms) => {
           if (document.visibilityState === "visible" && store.activeThreadId) {
               const t = store.threads.find(x => x.id === store.activeThreadId);
               if(t) { t.unread = 0; window.renderThreadList(); }
-              await apiPatch(threadPath(store.activeThreadId), { unread: 0, lastReadAtMs: Date.now() });
+              apiPatch(threadPath(store.activeThreadId), { unread: 0, lastReadAtMs: Date.now() }).catch(() => {});
           }
       });
 

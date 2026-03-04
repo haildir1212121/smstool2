@@ -8,7 +8,9 @@ module.exports = async function (context, req) {
 
         let q, params;
         if (since > 0) {
-            q = "SELECT * FROM c WHERE c.orgId = @orgId AND c.lastMessageAtMs > @since ORDER BY c.lastMessageAtMs DESC";
+            // Use Cosmos _ts (auto-updated on every write, unix seconds)
+            // so we capture ALL changes: unread resets, name edits, tag changes, etc.
+            q = "SELECT * FROM c WHERE c.orgId = @orgId AND c._ts >= @since ORDER BY c.lastMessageAtMs DESC";
             params = [{ name: "@orgId", value: orgId }, { name: "@since", value: since }];
         } else {
             q = "SELECT * FROM c WHERE c.orgId = @orgId ORDER BY c.lastMessageAtMs DESC";

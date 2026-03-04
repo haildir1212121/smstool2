@@ -214,16 +214,18 @@
   const SHARED_ORG_ID = "dispatch_team_main";
   const TWILIO_SEND_URL = `${SMS_BACKEND_BASE}/send-sms`;
   const TWILIO_GET_URL  = `${SMS_BACKEND_BASE}/get-messages`;
-  
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-  import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
-  import { getFirestore, collection, doc, setDoc, addDoc, updateDoc, deleteDoc, getDoc, onSnapshot, query, orderBy, limit, serverTimestamp, where, getDocs, increment, writeBatch } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
-  import { getStorage, ref as storageRef, getDownloadURL, uploadBytes } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js";
+  const API_BASE = "/api";
 
-  const app = initializeApp({ apiKey: "AIzaSyCaypEoug2f7OTJjKOdkkJPaZDypcr3NF8", authDomain: "sms-dlx.firebaseapp.com", projectId: "sms-dlx", storageBucket: "sms-dlx.firebasestorage.app", messagingSenderId: "522453095698", appId: "1:522453095698:web:ea217285e6e5160ee4cfcb" });
-  const auth = getAuth(app); const db = getFirestore(app); const storage = getStorage(app);
+  // Azure API helper functions (replaces Firebase SDK)
+  async function apiGet(path) { const res = await fetch(`${API_BASE}${path}`); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
+  async function apiPut(path, body) { const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
+  async function apiPatch(path, body) { const res = await fetch(`${API_BASE}${path}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
+  async function apiPost(path, body) { const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
+  async function apiDelete(path) { const res = await fetch(`${API_BASE}${path}`, { method: "DELETE" }); if (!res.ok) throw new Error(`API ${res.status}`); return res.json(); }
+  async function apiUpload(threadId, file) { const res = await fetch(`${API_BASE}/upload?threadId=${encodeURIComponent(threadId)}`, { method: "POST", headers: { "Content-Type": file.type || "application/octet-stream" }, body: file }); if (!res.ok) throw new Error(`Upload ${res.status}`); return res.json(); }
+
   // ADDED PAGINATION STATE
-  let store = { threads: [], logs: [], activeThreadId: null, activeThread: null, pinned: new Set(), drafts: {}, cannedReplies: [], deletedSids: new Set(), lastInboundSidSeen: new Set(), isPolling: false, pendingMedia: [], isFirstLoad: true, onlyUnread: false, onlyUrgent: false, tagFilter: new Set(), notifQueue: {}, notifTimer: null, cmPage: 1, logPage: 1, itemsPerPage: 15 };
+  let store = { threads: [], logs: [], activeThreadId: null, activeThread: null, pinned: new Set(), drafts: {}, cannedReplies: [], deletedSids: new Set(), lastInboundSidSeen: new Set(), isPolling: false, pendingMedia: [], isFirstLoad: true, onlyUnread: false, onlyUrgent: false, tagFilter: new Set(), notifQueue: {}, notifTimer: null, cmPage: 1, logPage: 1, itemsPerPage: 15, msgPollTimer: null };
   
   // Make store global so pagination buttons can access it
   window.store = store;
@@ -273,36 +275,36 @@ const ymd = (ms) => {
             data.messages.filter(m=>m.direction==="inbound" && !store.lastInboundSidSeen.has(m.sid)).forEach(async m => {
                 store.lastInboundSidSeen.add(m.sid);
                 const phone = normalizePhone(m.from);
-                const msgTime = new Date(m.dateCreated).getTime(); 
-                
-                await setDoc(doc(getMsgsCol(phone), m.sid), { body:m.body, direction:"received", createdAt: new Date(msgTime), sid:m.sid, mediaUrls: m.mediaUrls||[] });
-                
+                const msgTime = new Date(m.dateCreated).getTime();
+
+                await apiPut(messagePath(phone, m.sid), { body:m.body, direction:"received", createdAt: new Date(msgTime).toISOString(), sid:m.sid, mediaUrls: m.mediaUrls||[] });
+
                 const t = store.threads.find(x => x.id === phone);
                 const isViewing = (store.activeThreadId === phone && document.visibilityState === 'visible');
                 if (!isViewing) queueNotification(phone, t ? (t.name || phone) : phone, m.body);
 
                 const lowerBody = m.body.toLowerCase();
                 const isMaintenance = vehicleKeywords.some(k => lowerBody.includes(k));
-                
+
                 if (isMaintenance) {
-                    await addDoc(collection(db, "organizations", SHARED_ORG_ID, "logs"), {
+                    await apiPost("/logs", {
                         type: "vehicle_alert",
                         threadName: t ? (t.name || phone) : phone,
                         phone: phone,
                         message: m.body,
-                        threadId: phone,
-                        createdAt: serverTimestamp()
+                        threadId: phone
                     });
                     window.showToast("Vehicle Issue Detected!", "error");
                 }
 
-                const updateData = { lastMessageText: m.body, lastMessageAtMs: msgTime, unread: isViewing ? 0 : increment(1), id: phone, phone: phone };
-                if (isMaintenance) updateData.isUrgent = true; 
-                if (!t) updateData.name = phone; 
+                const updateData = { lastMessageText: m.body, lastMessageAtMs: msgTime, id: phone, phone: phone };
+                if (!isViewing) updateData._incrementUnread = 1; else updateData.unread = 0;
+                if (isMaintenance) updateData.isUrgent = true;
+                if (!t) updateData.name = phone;
 
                 const currentLastMs = t ? (t.lastMessageAtMs || 0) : 0;
                 if (msgTime > currentLastMs) {
-                    await setDoc(getThreadDoc(phone), updateData, { merge: true });
+                    await apiPut(threadPath(phone), updateData);
                 }
             });
           }
@@ -320,18 +322,14 @@ const ymd = (ms) => {
   };
   window.toggleInfoPanel = () => document.getElementById("infoPanel").classList.toggle("hidden");
 
-  let unsubMessages = null;
-  const getThreadsCol = () => collection(db, "organizations", SHARED_ORG_ID, "threads");
-  const getThreadDoc  = (id) => doc(db, "organizations", SHARED_ORG_ID, "threads", id);
-  const getMsgsCol    = (id) => collection(db, "organizations", SHARED_ORG_ID, "threads", id, "messages");
+  // Azure API path helpers (replacing Firebase collection/doc references)
+  const threadPath = (id) => `/threads/${encodeURIComponent(id)}`;
+  const messagesPath = (id) => `/threads/${encodeURIComponent(id)}/messages`;
+  const messagePath = (id, msgId) => `/threads/${encodeURIComponent(id)}/messages/${encodeURIComponent(msgId)}`;
 
   window.deleteActiveThread = async () => {
       if(!store.activeThreadId || !confirm("Permanently delete this conversation?")) return;
-      await deleteDoc(getThreadDoc(store.activeThreadId));
-      const snap = await getDocs(getMsgsCol(store.activeThreadId));
-      const batch = writeBatch(db);
-      snap.forEach(d => batch.delete(d.ref));
-      await batch.commit();
+      await apiDelete(threadPath(store.activeThreadId));
       store.activeThreadId = null;
       document.getElementById("messageList").innerHTML = "";
       document.getElementById("welcomeState").classList.remove("hidden");
@@ -341,11 +339,7 @@ const ymd = (ms) => {
 
   window.deleteContact = async (id) => {
       if(!confirm("Delete this contact and all their messages?")) return;
-      await deleteDoc(getThreadDoc(id));
-      const snap = await getDocs(getMsgsCol(id));
-      const batch = writeBatch(db);
-      snap.forEach(d => batch.delete(d.ref));
-      await batch.commit();
+      await apiDelete(threadPath(id));
       window.renderContactsManagerTable();
       window.showToast("Contact Deleted");
   };
@@ -409,8 +403,66 @@ const ymd = (ms) => {
   window.toggleTagFilter = (tag) => { if (store.tagFilter.has(tag)) store.tagFilter.delete(tag); else store.tagFilter.add(tag); window.renderThreadList(); window.renderLogbook(); window.renderContactsManagerTable(); };
   window.clearTagFilter = () => { store.tagFilter.clear(); window.renderThreadList(); window.renderLogbook(); window.renderContactsManagerTable(); };
 
+  function renderMessages(messages) {
+      const div = document.getElementById("messageList"); div.innerHTML = ""; const atts = [];
+      let lastDay = null;
+
+      messages.forEach(m => {
+        const isMe = m.direction === "sent";
+        if (m.mediaUrls) m.mediaUrls.forEach(u => atts.push(u));
+
+        const ts = m.createdAt ? new Date(m.createdAt).getTime() : null;
+        const dayKey = ymd(ts);
+
+        if (dayKey && dayKey !== lastDay) {
+          lastDay = dayKey;
+          div.innerHTML += `
+            <div class="flex justify-center my-3">
+              <div class="px-3 py-1 rounded-full text-[11px] font-bold text-slate-500 bg-white border border-slate-200 shadow-sm">
+                ${escapeHtml(formatDateLong(ts))}
+              </div>
+            </div>
+          `;
+        }
+
+        let mediaHtml = "";
+        if (m.mediaUrls && m.mediaUrls.length) {
+          mediaHtml =
+            `<div class="flex flex-col gap-2 mt-2">` +
+            m.mediaUrls
+              .map(u => `<a href="${u}" target="_blank"><img src="${u}" class="rounded-lg max-h-48 border bg-white object-cover"></a>`)
+              .join("") +
+            `</div>`;
+        }
+
+        div.innerHTML += `
+          <div class="flex w-full ${isMe ? "justify-end" : "justify-start"} fade-in">
+            <div class="max-w-[85%] lg:max-w-[70%]">
+              <div class="px-4 py-2.5 text-sm shadow-sm ${isMe ? "msg-sent" : "msg-received"}">
+                ${escapeHtml(m.body)}${mediaHtml}
+              </div>
+              <div class="text-[10px] text-gray-400 mt-1 ${isMe ? "text-right" : ""} opacity-75">
+                ${ts ? `${escapeHtml(formatDate(ts))} • ${escapeHtml(formatTime(ts))}` : ""}
+              </div>
+            </div>
+          </div>
+        `;
+      });
+      div.scrollTop = div.scrollHeight; document.getElementById("chatContainer").scrollTop = document.getElementById("chatContainer").scrollHeight;
+      document.getElementById("detailsAttachments").innerHTML = atts.slice(0,9).map(u => `<a href="${u}" target="_blank" class="block h-20 rounded-lg bg-slate-50 border bg-cover bg-center" style="background-image:url('${u}')"></a>`).join("");
+  }
+
+  async function pollMessages() {
+      if (!store.activeThreadId) return;
+      try {
+          const messages = await apiGet(messagesPath(store.activeThreadId));
+          renderMessages(messages);
+      } catch(e) { console.error("pollMessages error:", e); }
+  }
+
   window.loadThread = async (id) => {
-      if(unsubMessages) unsubMessages(); store.activeThreadId = id; store.activeThread = store.threads.find(t=>t.id===id);
+      if(store.msgPollTimer) clearInterval(store.msgPollTimer);
+      store.activeThreadId = id; store.activeThread = store.threads.find(t=>t.id===id);
       if(store.activeThread) { store.activeThread.unread = 0; window.renderThreadList(); }
       document.getElementById("welcomeState").classList.add("hidden");
       document.getElementById("activeContactName").innerText = store.activeThread?.name || id; document.getElementById("activeContactPhone").innerText = store.activeThread?.phone || id;
@@ -419,60 +471,10 @@ const ymd = (ms) => {
       document.getElementById("detailsTagsInput").value = (store.activeThread?.tags||[]).join(", "); document.getElementById("detailsNotes").value = store.activeThread?.notes||"";
       document.getElementById("msgInput").value = store.drafts[id] || "";
       document.getElementById("headerUrgentBtn").className = store.activeThread.isUrgent ? "w-8 h-8 flex items-center justify-center rounded bg-rose-100 text-rose-500" : "w-8 h-8 flex items-center justify-center rounded hover:bg-rose-50 hover:text-rose-500 text-slate-400";
-      try { await updateDoc(getThreadDoc(id), { unread: 0, lastReadAtMs: Date.now() }); } catch {}
-      
-      const q = query(getMsgsCol(id), orderBy("createdAt", "asc"));
-      unsubMessages = onSnapshot(q, s => {
-          const div = document.getElementById("messageList"); div.innerHTML = ""; const atts = [];
-          let lastDay = null;
+      try { await apiPatch(threadPath(id), { unread: 0, lastReadAtMs: Date.now() }); } catch {}
 
-s.forEach(d => {
-  const m = d.data();
-  const isMe = m.direction === "sent";
-
-  if (m.mediaUrls) m.mediaUrls.forEach(u => atts.push(u));
-
-  const ts = m.createdAt?.toMillis?.() || null;
-  const dayKey = ymd(ts);
-
-  // Date divider when day changes
-  if (dayKey && dayKey !== lastDay) {
-    lastDay = dayKey;
-    div.innerHTML += `
-      <div class="flex justify-center my-3">
-        <div class="px-3 py-1 rounded-full text-[11px] font-bold text-slate-500 bg-white border border-slate-200 shadow-sm">
-          ${escapeHtml(formatDateLong(ts))}
-        </div>
-      </div>
-    `;
-  }
-
-  let mediaHtml = "";
-  if (m.mediaUrls && m.mediaUrls.length) {
-    mediaHtml =
-      `<div class="flex flex-col gap-2 mt-2">` +
-      m.mediaUrls
-        .map(u => `<a href="${u}" target="_blank"><img src="${u}" class="rounded-lg max-h-48 border bg-white object-cover"></a>`)
-        .join("") +
-      `</div>`;
-  }
-
-  div.innerHTML += `
-    <div class="flex w-full ${isMe ? "justify-end" : "justify-start"} fade-in">
-      <div class="max-w-[85%] lg:max-w-[70%]">
-        <div class="px-4 py-2.5 text-sm shadow-sm ${isMe ? "msg-sent" : "msg-received"}">
-          ${escapeHtml(m.body)}${mediaHtml}
-        </div>
-        <div class="text-[10px] text-gray-400 mt-1 ${isMe ? "text-right" : ""} opacity-75">
-          ${ts ? `${escapeHtml(formatDate(ts))} • ${escapeHtml(formatTime(ts))}` : ""}
-        </div>
-      </div>
-    </div>
-  `;
-});
-          div.scrollTop = div.scrollHeight; document.getElementById("chatContainer").scrollTop = document.getElementById("chatContainer").scrollHeight;
-          document.getElementById("detailsAttachments").innerHTML = atts.slice(0,9).map(u => `<a href="${u}" target="_blank" class="block h-20 rounded-lg bg-slate-50 border bg-cover bg-center" style="background-image:url('${u}')"></a>`).join("");
-      });
+      await pollMessages();
+      store.msgPollTimer = setInterval(pollMessages, 3000);
   };
 
   const shiftKeywords = ["call it a day", "head home", "last trip", "good to go home", "done for the day", "you are clear"];
@@ -484,24 +486,23 @@ s.forEach(d => {
     try {
         const lowerTxt = txt.toLowerCase();
         if (shiftKeywords.some(k => lowerTxt.includes(k))) {
-            await addDoc(collection(db, "organizations", SHARED_ORG_ID, "logs"), { type:"end_shift", threadName: store.activeThread.name||"Unknown", phone: store.activeThread.phone, message:txt, threadId: store.activeThreadId, createdAt: serverTimestamp() });
+            await apiPost("/logs", { type:"end_shift", threadName: store.activeThread.name||"Unknown", phone: store.activeThread.phone, message:txt, threadId: store.activeThreadId });
             window.showToast("Logged: End of Shift");
         }
         let mediaUrls = [];
         if (store.pendingMedia.length) {
-  mediaUrls = await Promise.all(
-    store.pendingMedia.map(async (file, i) => {
-      const ref = storageRef(storage, `mms/${SHARED_ORG_ID}/${store.activeThreadId}/${Date.now()}_${i}`);
-      const snap = await uploadBytes(ref, file);
-      return await getDownloadURL(snap.ref);
-    })
-  );
-}
+          mediaUrls = await Promise.all(
+            store.pendingMedia.map(async (file) => {
+              const result = await apiUpload(store.activeThreadId, file);
+              return result.url;
+            })
+          );
+        }
         const res = await fetch(TWILIO_SEND_URL, { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: store.activeThread.phone, body: txt, mediaUrls }) });
         if(!res.ok) throw new Error("API Fail");
         const sid = `loc-${Date.now()}`;
-        await setDoc(doc(getMsgsCol(store.activeThreadId), sid), { body: txt, direction: "sent", createdAt: serverTimestamp(), sid, mediaUrls });
-        await updateDoc(getThreadDoc(store.activeThreadId), { lastMessageText: txt || "[Attachment]", lastMessageAtMs: Date.now() });
+        await apiPut(messagePath(store.activeThreadId, sid), { body: txt, direction: "sent", sid, mediaUrls });
+        await apiPatch(threadPath(store.activeThreadId), { lastMessageText: txt || "[Attachment]", lastMessageAtMs: Date.now() });
         document.getElementById("msgInput").value = ""; 
         document.getElementById("msgInput").style.height = 'auto'; // RESET HEIGHT
         store.pendingMedia=[]; window.updateMmsStrip();
@@ -515,12 +516,12 @@ s.forEach(d => {
       broadcastActive = true; document.getElementById("massComposeArea").classList.add("hidden"); document.getElementById("massProgressArea").classList.remove("hidden"); document.getElementById("massProgressArea").classList.add("flex");
       const log = document.getElementById("massLogBox"); const pBar = document.getElementById("massProgressBar");
       document.getElementById("massTotalCount").innerText = contacts.length; let sent = 0;
-      await addDoc(collection(db, "organizations", SHARED_ORG_ID, "logs"), { type:"broadcast_start", count: contacts.length, message:txt, createdAt: serverTimestamp() });
+      await apiPost("/logs", { type:"broadcast_start", count: contacts.length, message:txt });
       for(let i=0; i<contacts.length; i++) {
           if(!broadcastActive) break; const t = contacts[i]; log.innerHTML += `<div>Sending to ${t.name}...</div>`;
           try {
              const res = await fetch(TWILIO_SEND_URL, { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: t.phone, body: txt, mediaUrls: [] }) });
-             if(res.ok) { const sid = `mass-${Date.now()}-${Math.random()}`; await setDoc(doc(getMsgsCol(t.id), sid), { body: txt, direction: "sent", createdAt: serverTimestamp(), sid, mediaUrls: [] }); await updateDoc(getThreadDoc(t.id), { lastMessageText: txt, lastMessageAtMs: Date.now() }); sent++; document.getElementById("massSentCount").innerText = sent; pBar.style.width = `${(sent/contacts.length)*100}%`; } else { log.innerHTML += `<div class="text-rose-400">Failed: ${t.phone}</div>`; }
+             if(res.ok) { const sid = `mass-${Date.now()}-${Math.random()}`; await apiPut(messagePath(t.id, sid), { body: txt, direction: "sent", sid, mediaUrls: [] }); await apiPatch(threadPath(t.id), { lastMessageText: txt, lastMessageAtMs: Date.now() }); sent++; document.getElementById("massSentCount").innerText = sent; pBar.style.width = `${(sent/contacts.length)*100}%`; } else { log.innerHTML += `<div class="text-rose-400">Failed: ${t.phone}</div>`; }
           } catch(e) { log.innerHTML += `<div class="text-rose-400">Error: ${e.message}</div>`; }
           log.scrollTop = log.scrollHeight; await new Promise(r => setTimeout(r, 400)); 
       }
@@ -579,9 +580,9 @@ s.forEach(d => {
     const tags = document.querySelectorAll(".cm-tags");
     const updates = [];
     for(let i=0; i<names.length; i++) {
-        updates.push(updateDoc(getThreadDoc(names[i].dataset.id), { name: names[i].value.trim(), tags: tags[i].value.split(",").filter(Boolean) }));
+        updates.push(apiPatch(threadPath(names[i].dataset.id), { name: names[i].value.trim(), tags: tags[i].value.split(",").filter(Boolean) }));
     }
-    await Promise.all(updates); 
+    await Promise.all(updates);
     window.showToast("Directory Saved");
 };
 
@@ -601,8 +602,7 @@ s.forEach(d => {
 
       // LOAD ALL LOGS ONCE IF EMPTY (Client-side cache)
       if (store.logs.length === 0) {
-          const snap = await getDocs(query(collection(db, "organizations", SHARED_ORG_ID, "logs"), orderBy("createdAt", "desc"), limit(200))); 
-          store.logs = snap.docs.map(d => d.data());
+          store.logs = await apiGet("/logs?limit=200");
       }
 
       const tbody = document.getElementById("logbookList"); 
@@ -635,7 +635,7 @@ s.forEach(d => {
           const tagBadges = threadTags.slice(0,2).map(tag => `<span class="bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded text-[9px] border border-slate-200 font-bold mr-1">${tag}</span>`).join("");
 
           tbody.innerHTML += `<tr>
-            <td class="p-4 pl-6 text-xs font-mono text-slate-500">${new Date(l.createdAt?.toMillis()).toLocaleString()}</td>
+            <td class="p-4 pl-6 text-xs font-mono text-slate-500">${new Date(l.createdAt).toLocaleString()}</td>
             <td class="p-4 text-sm font-bold text-slate-800">
                 ${escapeHtml(l.threadName || l.phone || "System")}
                 <div class="mt-1">${tagBadges}</div>
@@ -652,50 +652,55 @@ s.forEach(d => {
   window.changeLogPage = (dir) => { store.logPage += dir; window.renderLogbook(); };
 
   window.openNewMsgModal = () => document.getElementById("newMsgModal").classList.remove("hidden");
- window.createThreadFromModal = async () => { 
+ window.createThreadFromModal = async () => {
     const rawPhone = document.getElementById("newContactPhone").value;
-    const cleanPhone = normalizePhone(rawPhone); 
+    const cleanPhone = normalizePhone(rawPhone);
     const name = document.getElementById("newContactName").value;
     if(cleanPhone.length < 10) { window.showToast("Invalid Phone Number", "error"); return; }
-    await setDoc(getThreadDoc(cleanPhone), { id: cleanPhone, phone: cleanPhone, name: name, unread:0, lastMessageAtMs: Date.now() }, {merge:true}); 
-    document.getElementById("newMsgModal").classList.add("hidden"); 
-    window.loadThread(cleanPhone); 
+    await apiPut(threadPath(cleanPhone), { id: cleanPhone, phone: cleanPhone, name: name, unread:0, lastMessageAtMs: Date.now() });
+    document.getElementById("newMsgModal").classList.add("hidden");
+    window.loadThread(cleanPhone);
 };
-  window.toggleUrgentThread = async () => { if(store.activeThreadId) await updateDoc(getThreadDoc(store.activeThreadId), { isUrgent: !store.activeThread.isUrgent }); };
+  window.toggleUrgentThread = async () => { if(store.activeThreadId) await apiPatch(threadPath(store.activeThreadId), { isUrgent: !store.activeThread.isUrgent }); };
   window.toggleUnreadOnly = () => { store.onlyUnread = !store.onlyUnread; window.renderThreadList(); };
   window.toggleUrgentOnly = () => { store.onlyUrgent = !store.onlyUrgent; window.renderThreadList(); };
   window.openSettingsModal = () => { document.getElementById("settingsModal").classList.remove("hidden"); document.getElementById("cannedRepliesInput").value = store.cannedReplies.join("\n"); };
   window.saveSettings = () => { store.cannedReplies = document.getElementById("cannedRepliesInput").value.split("\n").filter(Boolean); localStorage.setItem("canned", JSON.stringify(store.cannedReplies)); document.getElementById("settingsModal").classList.add("hidden"); window.renderQuickReplies(); };
   window.renderQuickReplies = () => { const r = document.getElementById("quickRepliesRow"); r.innerHTML=""; (JSON.parse(localStorage.getItem("canned")||"[]")).forEach(t => { const b=document.createElement("button"); b.className="shrink-0 px-3 py-1 bg-white border border-gray-200 rounded-full text-xs text-gray-600 whitespace-nowrap hover:border-blue-400 transition shadow-sm"; b.innerText=t; b.onclick=()=>{document.getElementById("msgInput").value+=t;}; r.appendChild(b); }); };
   window.insertTemplate = () => { const v = document.getElementById("templateSelect").value; if(v) document.getElementById("msgInput").value += v; document.getElementById("templateSelect").value = ""; };
-  window.saveDetailsTags = () => updateDoc(getThreadDoc(store.activeThreadId), { tags: document.getElementById("detailsTagsInput").value.split(",") });
-  window.saveDetailsNotes = () => updateDoc(getThreadDoc(store.activeThreadId), { notes: document.getElementById("detailsNotes").value });
+  window.saveDetailsTags = () => apiPatch(threadPath(store.activeThreadId), { tags: document.getElementById("detailsTagsInput").value.split(",").map(t=>t.trim()).filter(Boolean) });
+  window.saveDetailsNotes = () => apiPatch(threadPath(store.activeThreadId), { notes: document.getElementById("detailsNotes").value });
   window.handleMmsFiles = (inp) => { store.pendingMedia = Array.from(inp.files); window.updateMmsStrip(); };
   window.updateMmsStrip = () => { const d = document.getElementById("mmsStrip"); d.classList.toggle("hidden", !store.pendingMedia.length); d.innerHTML = store.pendingMedia.map(f => `<div class="h-10 w-10 bg-slate-200 rounded overflow-hidden flex items-center justify-center text-xs border border-slate-300"><i class="fa-solid fa-file"></i></div>`).join(""); };
   window.callActivePhone = () => window.open(`tel:${store.activeThread?.phone}`);
   window.copyActivePhone = () => { navigator.clipboard.writeText(store.activeThread?.phone); window.showToast("Copied"); };
   
+  async function pollThreads() {
+      try {
+          const threads = await apiGet("/threads");
+          store.threads = threads.map(d => { if (!d.id) d.id = d.phone; return d; });
+          if(store.activeThreadId) store.activeThread = store.threads.find(t=>t.id===store.activeThreadId);
+          window.renderThreadList();
+          if(store.activeThreadId && store.activeThread) document.getElementById("activeContactName").innerText = store.activeThread.name;
+      } catch(e) { console.error("pollThreads error:", e); }
+  }
+
   (async function init() {
-      await signInAnonymously(auth);
-      onAuthStateChanged(auth, u => {
-          if(!u) return;
-          onSnapshot(query(getThreadsCol()), s => {
-              store.threads = s.docs.map(d => { const data = d.data(); if (!data.id) data.id = d.id; return data; });
-              if(store.activeThreadId) store.activeThread = store.threads.find(t=>t.id===store.activeThreadId);
-              window.renderThreadList();
-              if(store.activeThreadId && store.activeThread) document.getElementById("activeContactName").innerText = store.activeThread.name; 
-          });
-          setInterval(poll, 8000);
-      });
+      // Initial data load from Azure Cosmos DB
+      await pollThreads();
+      // Poll threads and Twilio messages on intervals
+      setInterval(pollThreads, 5000);
+      setInterval(poll, 8000);
+
       store.cannedReplies = JSON.parse(localStorage.getItem("canned")||"[]"); window.renderQuickReplies();
       document.addEventListener("visibilitychange", async () => {
           if (document.visibilityState === "visible" && store.activeThreadId) {
               const t = store.threads.find(x => x.id === store.activeThreadId);
               if(t) { t.unread = 0; window.renderThreadList(); }
-              await updateDoc(getThreadDoc(store.activeThreadId), { unread: 0, lastReadAtMs: Date.now() });
+              await apiPatch(threadPath(store.activeThreadId), { unread: 0, lastReadAtMs: Date.now() });
           }
       });
-      
+
       const msgInput = document.getElementById("msgInput");
       msgInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = (this.scrollHeight) + 'px'; });
       msgInput.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); window.sendMessage(); } });
